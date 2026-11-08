@@ -106,3 +106,102 @@ def test_unknown_transaction_type_is_a_row_error(client, seed_data):
     response = client.post('/api/v1/ingestion/upload', files={'file': ('bad.csv', io.BytesIO(content), 'text/csv')}, data=data, headers=seed_data['headers'])
     assert response.status_code == 200
     assert response.json()['valid_rows'] == 0 and response.json()['error_rows'] == 1
+
+
+def test_ambiguous_date_requires_explicit_format(client, db_session, seed_data):
+    from datetime import datetime
+    from app.models.transaction import NormalizedTransaction
+    def submit(content, mapping):
+        return client.post('/api/v1/ingestion/upload', headers=seed_data['headers'],
+            files={'file': ('statement.csv', io.BytesIO(content), 'text/csv')},
+            data={'account_id': seed_data['bank_account'].id, 'mapping_json': json.dumps(mapping)})
+    base = {'date_col': 'Date', 'amount_col': 'Amount', 'type_col': 'Type'}
+    missing = submit(b'Date,Amount,Type\n04/03/2026,100,CREDIT\n', base)
+    assert missing.status_code == 200 and missing.json()['valid_rows'] == 0 and missing.json()['error_rows'] == 1
+    explicit = submit(b'Date,Amount,Type\n05/03/2026,100,CREDIT\n', {**base, 'date_format': '%d/%m/%Y'})
+    assert explicit.status_code == 200 and explicit.json()['valid_rows'] == 1
+    tx = db_session.query(NormalizedTransaction).filter_by(batch_id=explicit.json()['id']).one()
+    assert tx.transaction_date == datetime(2026, 3, 5)
+
+
+def test_missing_or_conflicting_direction_does_not_create_transaction(client, db_session, seed_data):
+    from app.models.transaction import NormalizedTransaction
+    content = b'Date,Amount,Type\n2026-01-01,100,\n2026-01-02,-50,CREDIT\n'
+    response = client.post('/api/v1/ingestion/upload', headers=seed_data['headers'],
+        files={'file': ('bad.csv', io.BytesIO(content), 'text/csv')}, data={
+        'account_id': seed_data['bank_account'].id,
+        'mapping_json': json.dumps({'date_col': 'Date', 'amount_col': 'Amount', 'type_col': 'Type'})})
+    assert response.status_code == 200 and response.json()['error_rows'] == 2
+    assert db_session.query(NormalizedTransaction).count() == 0
+
+
+def test_split_debit_credit_columns_are_not_silently_dropped(client, seed_data):
+    content = b'Date,Debit,Credit\n2026-01-01,50,\n2026-01-02,,100\n'
+    response = client.post('/api/v1/ingestion/upload', headers=seed_data['headers'],
+        files={'file': ('bank.csv', io.BytesIO(content), 'text/csv')}, data={
+        'account_id': seed_data['bank_account'].id,
+        'mapping_json': json.dumps({'date_col': 'Date', 'amount_col': 'Credit', 'default_type': 'CREDIT'})})
+    assert response.status_code == 400 and 'Separate debit and credit' in response.json()['detail']
+
+
+def test_import_errors_are_visible_only_to_their_organization(client, db_session, seed_data):
+    from app.models.organization import Organization
+    from app.models.user import User, UserRole
+    from app.utils.security import create_access_token
+    content = b'Date,Amount,Type\n04/03/2026,100,CREDIT\n'
+    response = client.post('/api/v1/ingestion/upload', headers=seed_data['headers'],
+        files={'file': ('bad.csv', io.BytesIO(content), 'text/csv')}, data={
+        'account_id': seed_data['bank_account'].id,
+        'mapping_json': json.dumps({'date_col': 'Date', 'amount_col': 'Amount', 'type_col': 'Type'})})
+    assert response.status_code == 200
+    batch_id = response.json()['id']
+    errors = client.get(f'/api/v1/ingestion/batches/{batch_id}/errors', headers=seed_data['headers'])
+    assert errors.status_code == 200 and len(errors.json()) == 1
+    assert errors.json()[0]['row_number'] == 2 and 'date' in errors.json()[0]['error_message'].lower()
+    other = Organization(name='Other', slug='other', default_currency='USD'); db_session.add(other); db_session.flush()
+    user = User(organization_id=other.id, email='other@example.com', hashed_password='unused', full_name='Other', role=UserRole.OWNER)
+    db_session.add(user); db_session.commit()
+    token = create_access_token({'sub': user.id, 'org_id': other.id})
+    denied = client.get(f'/api/v1/ingestion/batches/{batch_id}/errors', headers={'Authorization': f'Bearer {token}'})
+    assert denied.status_code == 404
+
+
+def test_retry_only_failed_rows_preserves_source_and_avoids_duplicates(client, db_session, seed_data):
+    from app.models.ingestion import RawTransaction
+    from app.models.transaction import NormalizedTransaction
+    from app.models.audit import AuditEvent
+    content = b'Date,Amount,Type\n2026-03-04,100,CREDIT\n05/03/2026,25,CREDIT\n'
+    mapping = {'date_col': 'Date', 'amount_col': 'Amount', 'type_col': 'Type'}
+    first = client.post('/api/v1/ingestion/upload', headers=seed_data['headers'],
+        files={'file': ('mixed.csv', io.BytesIO(content), 'text/csv')}, data={
+            'account_id': seed_data['bank_account'].id, 'mapping_json': json.dumps(mapping)})
+    assert first.status_code == 200
+    batch = first.json(); assert (batch['valid_rows'], batch['error_rows']) == (1, 1)
+    original = db_session.query(RawTransaction).filter_by(batch_id=batch['id'], row_number=3).one().raw_data.copy()
+    retry = client.post(f"/api/v1/ingestion/batches/{batch['id']}/retry", headers=seed_data['headers'],
+        json={**mapping, 'date_format': '%d/%m/%Y'})
+    assert retry.status_code == 200 and (retry.json()['valid_rows'], retry.json()['error_rows']) == (2, 0)
+    assert db_session.query(NormalizedTransaction).filter_by(batch_id=batch['id']).count() == 2
+    row = db_session.query(RawTransaction).filter_by(batch_id=batch['id'], row_number=3).one()
+    db_session.refresh(row); assert row.raw_data == original and row.error_message is None
+    assert db_session.query(AuditEvent).filter_by(resource_id=batch['id'], action='RETRY_IMPORT_ERRORS').count() == 1
+    again = client.post(f"/api/v1/ingestion/batches/{batch['id']}/retry", headers=seed_data['headers'], json=mapping)
+    assert again.status_code == 400
+    assert db_session.query(NormalizedTransaction).filter_by(batch_id=batch['id']).count() == 2
+
+
+def test_retry_rejects_another_tenant(client, db_session, seed_data):
+    from app.models.organization import Organization
+    from app.models.user import User, UserRole
+    from app.utils.security import create_access_token
+    content = b'Date,Amount,Type\n04/03/2026,100,CREDIT\n'
+    mapping = {'date_col': 'Date', 'amount_col': 'Amount', 'type_col': 'Type'}
+    result = client.post('/api/v1/ingestion/upload', headers=seed_data['headers'], files={'file': ('a.csv', io.BytesIO(content), 'text/csv')},
+        data={'account_id': seed_data['bank_account'].id, 'mapping_json': json.dumps(mapping)})
+    other = Organization(name='Foreign', slug='foreign', default_currency='USD'); db_session.add(other); db_session.flush()
+    user = User(organization_id=other.id, email='foreign@example.com', hashed_password='unused', full_name='Other', role=UserRole.OWNER)
+    db_session.add(user); db_session.commit()
+    token = create_access_token({'sub': user.id, 'org_id': other.id})
+    response = client.post(f"/api/v1/ingestion/batches/{result.json()['id']}/retry", headers={'Authorization': f'Bearer {token}'}, json=mapping)
+    assert response.status_code == 400
+    assert client.get(f"/api/v1/ingestion/batches/{result.json()['id']}/errors", headers=seed_data['headers']).json()[0]['row_number'] == 2

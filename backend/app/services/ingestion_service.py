@@ -1,9 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 import hashlib
 from decimal import Decimal, InvalidOperation
 from sqlalchemy.orm import Session
-from dateutil import parser as date_parser
 
 from app.models.ingestion import ImportBatch, RawTransaction, IngestionStatus, FileType
 from app.models.transaction import NormalizedTransaction, TransactionType, ReconciliationStatus
@@ -42,7 +41,7 @@ class IngestionService:
         account_id: Optional[str] = None
     ) -> ImportPreviewResponse:
         file_hash = hashlib.sha256(file_bytes).hexdigest()
-        
+
         # Check duplicate file
         existing_batch = self.db.query(ImportBatch).filter(
             ImportBatch.organization_id == organization_id,
@@ -81,7 +80,7 @@ class IngestionService:
                 reference_col=ref_col,
                 type_col=type_col,
                 description_col=desc_col,
-                default_type="CREDIT"
+                default_type=None
             )
 
         return ImportPreviewResponse(
@@ -96,6 +95,165 @@ class IngestionService:
             detected_adapter=detected_adapter,
             suggested_mapping=suggested_mapping
         )
+
+    def _normalize_row(self, r, column_mapping, organization_id, account_id, account, batch, row_num):
+        # Extract and parse date
+        raw_date_str = str(r.get(column_mapping.date_col, "")).strip()
+        if not raw_date_str:
+            raise ValueError(f"Missing date in column '{column_mapping.date_col}'")
+
+        try:
+            parsed_date = (datetime.strptime(raw_date_str, column_mapping.date_format)
+                if column_mapping.date_format else datetime.fromisoformat(raw_date_str))
+            if parsed_date.tzinfo is not None:
+                parsed_date = parsed_date.astimezone(timezone.utc).replace(tzinfo=None)
+        except ValueError:
+            raise ValueError("Invalid date; use ISO dates or select the statement date format")
+
+        # Extract and parse amount
+        raw_amount_str = str(r.get(column_mapping.amount_col, "")).replace(",", "").replace("$", "").strip()
+        if not raw_amount_str:
+            raise ValueError(f"Missing amount in column '{column_mapping.amount_col}'")
+
+        amount_decimal = parse_statement_amount(raw_amount_str)
+        is_negative = amount_decimal < Decimal("0.0000")
+        amount_abs = abs(amount_decimal)
+        if amount_abs == 0:
+            raise ValueError("Transaction amount must be greater than zero")
+
+        # Determine transaction type (DEBIT or CREDIT)
+        tx_type = TransactionType.CREDIT
+        if column_mapping.type_col and r.get(column_mapping.type_col):
+            val = str(r[column_mapping.type_col]).upper().strip()
+            if val in {"DEBIT", "DR", "PAYMENT", "OUT", "WITHDRAWAL", "EXPENSE", "CHARGE"}:
+                tx_type = TransactionType.DEBIT
+            elif val in {"CREDIT", "CR", "IN", "DEPOSIT", "RECEIPT"}:
+                if is_negative:
+                    raise ValueError("Negative amount conflicts with CREDIT transaction type")
+                tx_type = TransactionType.CREDIT
+            else:
+                raise ValueError("Unrecognized transaction type; use a mapped debit or credit value")
+        elif is_negative:
+            tx_type = TransactionType.DEBIT
+        elif column_mapping.default_type:
+            tx_type = TransactionType.DEBIT if column_mapping.default_type.upper() == "DEBIT" else TransactionType.CREDIT
+        else:
+            raise ValueError("Transaction direction is missing; select a default direction")
+
+        # Reference
+        external_ref = None
+        if column_mapping.reference_col and r.get(column_mapping.reference_col):
+            external_ref = str(r[column_mapping.reference_col]).strip()
+
+        # Fee
+        fee_decimal = Decimal("0.0000")
+        if column_mapping.fee_col and r.get(column_mapping.fee_col):
+            fee_raw = str(r[column_mapping.fee_col]).replace(",", "").replace("$", "").strip()
+            fee_decimal = abs(parse_statement_amount(fee_raw))
+
+        # Balance after
+        balance_after = None
+        if column_mapping.balance_col and r.get(column_mapping.balance_col):
+            bal_raw = str(r[column_mapping.balance_col]).replace(",", "").replace("$", "").strip()
+            balance_after = parse_statement_amount(bal_raw)
+
+        # Description and Counterparty
+        desc = None
+        if column_mapping.description_col and r.get(column_mapping.description_col):
+            desc = str(r[column_mapping.description_col]).strip()
+
+        counterparty = None
+        if column_mapping.counterparty_col and r.get(column_mapping.counterparty_col):
+            counterparty = str(r[column_mapping.counterparty_col]).strip()
+
+        # Duplicate detection within the same organization and account
+        is_duplicate_tx = False
+        duplicate_parent_id = None
+        if external_ref:
+            existing_tx = self.db.query(NormalizedTransaction).filter(
+                NormalizedTransaction.organization_id == organization_id,
+                NormalizedTransaction.financial_account_id == account_id,
+                NormalizedTransaction.external_reference == external_ref,
+                NormalizedTransaction.amount == amount_abs,
+                NormalizedTransaction.transaction_date == parsed_date,
+                NormalizedTransaction.transaction_type == tx_type,
+                NormalizedTransaction.is_duplicate == False
+            ).first()
+            if existing_tx:
+                is_duplicate_tx = True
+                duplicate_parent_id = existing_tx.id
+
+        normalized_tx = NormalizedTransaction(
+            organization_id=organization_id,
+            batch_id=batch.id,
+            financial_account_id=account_id,
+            branch_id=account.branch_id,
+            external_reference=external_ref,
+            internal_reference=f"TXN-{batch.id[:6]}-{row_num:04d}",
+            transaction_date=parsed_date,
+            amount=amount_abs,
+            currency=account.currency,
+            transaction_type=tx_type,
+            fee_amount=fee_decimal,
+            balance_after=balance_after,
+            counterparty_name=counterparty,
+            description=desc,
+            reconciliation_status=ReconciliationStatus.UNRECONCILED,
+            is_duplicate=is_duplicate_tx,
+            duplicate_of_id=duplicate_parent_id
+        )
+        self.db.add(normalized_tx)
+        self.db.flush()
+
+
+
+    def retry_failed_rows(self, batch_id: str, organization_id: str, column_mapping: ColumnMapping, user_id: str) -> ImportBatch:
+        # The tenant lock serializes retries with imports and other retries on PostgreSQL.
+        self.db.query(Organization).filter(Organization.id == organization_id).with_for_update().one()
+        batch = self.db.query(ImportBatch).filter(ImportBatch.id == batch_id,
+            ImportBatch.organization_id == organization_id).with_for_update().first()
+        if not batch:
+            raise ValueError('Import batch not found')
+        if batch.file_type == FileType.MANUAL:
+            raise ValueError('Manual entries cannot be retried as a statement')
+        account = self.db.query(FinancialAccount).filter(FinancialAccount.id == batch.financial_account_id,
+            FinancialAccount.organization_id == organization_id, FinancialAccount.is_active == True).first()
+        if not account:
+            raise ValueError('Financial account is unavailable')
+        rows = self.db.query(RawTransaction).filter(RawTransaction.batch_id == batch.id,
+            RawTransaction.organization_id == organization_id, RawTransaction.error_message.isnot(None)).with_for_update().all()
+        if not rows:
+            raise ValueError('This batch has no failed rows to retry')
+        headers = set(rows[0].raw_data) - {'_row_number'}
+        mapped = [column_mapping.date_col, column_mapping.amount_col, column_mapping.reference_col,
+                  column_mapping.type_col, column_mapping.description_col, column_mapping.fee_col,
+                  column_mapping.balance_col, column_mapping.counterparty_col]
+        if any(column and column not in headers for column in mapped):
+            raise ValueError('A mapped column is not present in the original statement')
+        lowered = {header.strip().lower() for header in headers}
+        if {'debit', 'credit'} <= lowered and column_mapping.amount_col.strip().lower() in {'debit', 'credit'}:
+            raise ValueError('Separate debit and credit columns are not yet supported')
+
+        prior_errors = [{'row': row.row_number, 'error': row.error_message} for row in rows]
+        corrected = 0
+        for row in rows:
+            try:
+                self._normalize_row(row.raw_data, column_mapping, organization_id,
+                                    account.id, account, batch, row.row_number)
+                row.error_message = None
+                corrected += 1
+            except (ValueError, TypeError, OverflowError) as exc:
+                row.error_message = str(exc)[:500]
+        batch.valid_rows += corrected
+        batch.error_rows = len(rows) - corrected
+        batch.status = IngestionStatus.NORMALIZED if batch.valid_rows else IngestionStatus.FAILED
+        log_audit_event(db=self.db, organization_id=organization_id, action='RETRY_IMPORT_ERRORS',
+            resource_type='IMPORT_BATCH', resource_id=batch.id, user_id=user_id,
+            details={'mapping': column_mapping.model_dump(), 'prior_errors': prior_errors,
+                     'corrected_rows': corrected, 'remaining_errors': batch.error_rows})
+        self.db.commit()
+        self.db.refresh(batch)
+        return batch
 
     def process_import(
         self,
@@ -131,6 +289,16 @@ class IngestionService:
         else:
             headers, rows, total_rows = self.csv_adapter.parse_file(file_bytes)
 
+        mapped_columns = [column_mapping.date_col, column_mapping.amount_col, column_mapping.reference_col,
+            column_mapping.type_col, column_mapping.description_col, column_mapping.fee_col,
+            column_mapping.balance_col, column_mapping.counterparty_col]
+        missing = [column for column in mapped_columns if column and column not in headers]
+        if missing:
+            raise ValueError("Mapped columns are not present in the statement: " + ", ".join(missing))
+        lowered = {h.strip().lower() for h in headers}
+        if 'debit' in lowered and 'credit' in lowered and column_mapping.amount_col.strip().lower() in {'debit', 'credit'}:
+            raise ValueError("Separate debit and credit columns are not yet supported; prepare a signed amount column and retain the original statement")
+
         batch = ImportBatch(
             organization_id=organization_id,
             financial_account_id=account_id,
@@ -161,104 +329,10 @@ class IngestionService:
             self.db.add(raw_tx)
 
             try:
-                # Extract and parse date
-                raw_date_str = str(r.get(column_mapping.date_col, "")).strip()
-                if not raw_date_str:
-                    raise ValueError(f"Missing date in column '{column_mapping.date_col}'")
-                
-                parsed_date = date_parser.parse(raw_date_str)
-
-                # Extract and parse amount
-                raw_amount_str = str(r.get(column_mapping.amount_col, "")).replace(",", "").replace("$", "").strip()
-                if not raw_amount_str:
-                    raise ValueError(f"Missing amount in column '{column_mapping.amount_col}'")
-                
-                amount_decimal = parse_statement_amount(raw_amount_str)
-                is_negative = amount_decimal < Decimal("0.0000")
-                amount_abs = abs(amount_decimal)
-
-                # Determine transaction type (DEBIT or CREDIT)
-                tx_type = TransactionType.CREDIT
-                if column_mapping.type_col and r.get(column_mapping.type_col):
-                    val = str(r[column_mapping.type_col]).upper().strip()
-                    if val in {"DEBIT", "DR", "PAYMENT", "OUT", "WITHDRAWAL", "EXPENSE", "CHARGE"}:
-                        tx_type = TransactionType.DEBIT
-                    elif val in {"CREDIT", "CR", "IN", "DEPOSIT", "RECEIPT"}:
-                        tx_type = TransactionType.CREDIT
-                    else:
-                        raise ValueError("Unrecognized transaction type; use a mapped debit or credit value")
-                elif is_negative:
-                    tx_type = TransactionType.DEBIT
-                elif column_mapping.default_type:
-                    tx_type = TransactionType.DEBIT if column_mapping.default_type.upper() == "DEBIT" else TransactionType.CREDIT
-
-                # Reference
-                external_ref = None
-                if column_mapping.reference_col and r.get(column_mapping.reference_col):
-                    external_ref = str(r[column_mapping.reference_col]).strip()
-
-                # Fee
-                fee_decimal = Decimal("0.0000")
-                if column_mapping.fee_col and r.get(column_mapping.fee_col):
-                    fee_raw = str(r[column_mapping.fee_col]).replace(",", "").replace("$", "").strip()
-                    fee_decimal = abs(parse_statement_amount(fee_raw))
-
-                # Balance after
-                balance_after = None
-                if column_mapping.balance_col and r.get(column_mapping.balance_col):
-                    bal_raw = str(r[column_mapping.balance_col]).replace(",", "").replace("$", "").strip()
-                    balance_after = parse_statement_amount(bal_raw)
-
-                # Description and Counterparty
-                desc = None
-                if column_mapping.description_col and r.get(column_mapping.description_col):
-                    desc = str(r[column_mapping.description_col]).strip()
-
-                counterparty = None
-                if column_mapping.counterparty_col and r.get(column_mapping.counterparty_col):
-                    counterparty = str(r[column_mapping.counterparty_col]).strip()
-
-                # Duplicate detection within the same organization and account
-                is_duplicate_tx = False
-                duplicate_parent_id = None
-                if external_ref:
-                    existing_tx = self.db.query(NormalizedTransaction).filter(
-                        NormalizedTransaction.organization_id == organization_id,
-                        NormalizedTransaction.financial_account_id == account_id,
-                        NormalizedTransaction.external_reference == external_ref,
-                        NormalizedTransaction.amount == amount_abs,
-                        NormalizedTransaction.transaction_date == parsed_date,
-                        NormalizedTransaction.transaction_type == tx_type,
-                        NormalizedTransaction.is_duplicate == False
-                    ).first()
-                    if existing_tx:
-                        is_duplicate_tx = True
-                        duplicate_parent_id = existing_tx.id
-
-                normalized_tx = NormalizedTransaction(
-                    organization_id=organization_id,
-                    batch_id=batch.id,
-                    financial_account_id=account_id,
-                    branch_id=account.branch_id,
-                    external_reference=external_ref,
-                    internal_reference=f"TXN-{batch.id[:6]}-{row_num:04d}",
-                    transaction_date=parsed_date,
-                    amount=amount_abs,
-                    currency=account.currency,
-                    transaction_type=tx_type,
-                    fee_amount=fee_decimal,
-                    balance_after=balance_after,
-                    counterparty_name=counterparty,
-                    description=desc,
-                    reconciliation_status=ReconciliationStatus.UNRECONCILED,
-                    is_duplicate=is_duplicate_tx,
-                    duplicate_of_id=duplicate_parent_id
-                )
-                self.db.add(normalized_tx)
-                self.db.flush()
+                self._normalize_row(r, column_mapping, organization_id, account_id, account, batch, row_num)
                 valid_count += 1
 
-            except Exception as e:
+            except (ValueError, TypeError, OverflowError) as e:
                 raw_tx.error_message = str(e)
                 error_count += 1
 

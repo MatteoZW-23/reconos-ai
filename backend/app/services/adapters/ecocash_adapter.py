@@ -33,7 +33,7 @@ class EcoCashAdapter(StatementAdapter):
             fee_col=fee_col,
             balance_col=balance_col,
             description_col=desc_col,
-            default_type="CREDIT"
+            default_type=None
         )
 
     def parse_file(self, content_bytes: bytes) -> tuple[list[str], list[dict[str, Any]], int]:

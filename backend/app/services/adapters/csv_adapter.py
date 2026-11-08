@@ -37,6 +37,8 @@ class CsvAdapter(StatementAdapter):
 
         rows = []
         for idx, row in enumerate(reader):
+            if None in row:
+                raise ValueError(f"Row {idx + 2} has more fields than the header")
             # Clean keys and strip whitespace
             cleaned_row = {k.strip(): (v.strip() if v else "") for k, v in row.items() if k}
             if any(cleaned_row.values()):

@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 from datetime import datetime
 from app.models.ingestion import IngestionStatus, FileType
 
@@ -13,7 +13,7 @@ class ColumnMapping(BaseModel):
     balance_col: Optional[str] = None
     counterparty_col: Optional[str] = None
     date_format: Optional[str] = None  # e.g., "%Y-%m-%d" or "%d/%m/%Y"
-    default_type: Optional[str] = None # "CREDIT" or "DEBIT" if not in column
+    default_type: Optional[Literal['CREDIT', 'DEBIT']] = None
 
 class ImportPreviewResponse(BaseModel):
     file_name: str

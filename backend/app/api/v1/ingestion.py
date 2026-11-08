@@ -4,8 +4,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User, UserRole
-from app.models.ingestion import ImportBatch
-from app.schemas.ingestion import ImportPreviewResponse, BatchResponse, ColumnMapping
+from app.models.ingestion import ImportBatch, RawTransaction
+from app.schemas.ingestion import ImportPreviewResponse, BatchResponse, ColumnMapping, RawTransactionResponse
 from app.services.ingestion_service import IngestionService
 from app.services.ai_investigation.anomaly_detector import AnomalyDetector
 from app.api.deps import get_current_user, require_roles
@@ -98,3 +98,29 @@ def list_import_batches(
     if account_id:
         query = query.filter(ImportBatch.financial_account_id == account_id)
     return query.order_by(ImportBatch.created_at.desc()).limit(100).all()
+
+@router.get('/batches/{batch_id}/errors', response_model=list[RawTransactionResponse])
+def list_import_errors(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id,
+        ImportBatch.organization_id == current_user.organization_id).first()
+    if batch is None:
+        raise HTTPException(status_code=404, detail='Import batch not found')
+    return db.query(RawTransaction).filter(RawTransaction.batch_id == batch_id,
+        RawTransaction.organization_id == current_user.organization_id,
+        RawTransaction.error_message.isnot(None)).order_by(RawTransaction.row_number).limit(100).all()
+
+@router.post('/batches/{batch_id}/retry', response_model=BatchResponse)
+def retry_import_errors(
+    batch_id: str,
+    mapping: ColumnMapping,
+    current_user: User = Depends(require_roles([UserRole.OWNER, UserRole.ADMIN, UserRole.FINANCE_MANAGER, UserRole.ACCOUNTANT])),
+    db: Session = Depends(get_db),
+):
+    try:
+        return IngestionService(db).retry_failed_rows(batch_id, current_user.organization_id, mapping, current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
